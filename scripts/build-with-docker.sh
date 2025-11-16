@@ -52,6 +52,9 @@ if [[ "${CONTAINER_IMAGE}" == *"alinux3"* ]]; then
         mkdir -p /etc/yum.repos.d/backup
         cp /etc/yum.repos.d/*.repo /etc/yum.repos.d/backup/ 2>/dev/null || true
 
+        # Remove all existing repo files to avoid duplicates
+        rm -f /etc/yum.repos.d/*.repo
+
         # Replace with Aliyun public mirror
         cat > /etc/yum.repos.d/alinux3.repo <<EOF
 [alinux3-os]
