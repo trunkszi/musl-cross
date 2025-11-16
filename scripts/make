@@ -1,0 +1,260 @@
+#!/bin/bash
+
+set -e
+
+# Disable color output to avoid ANSI escape sequences interfering with script execution
+# These environment variables affect the output of grep, ls and other commands
+export GREP_OPTIONS=
+export GREP_COLORS=
+unset GREP_OPTIONS
+unset GREP_COLORS
+# Ensure grep does not use color
+alias grep='grep --color=never' 2>/dev/null || true
+# Disable color output for ls
+unalias ls 2>/dev/null || true
+
+# Script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Check if sudo is needed (usually runs as root in Docker containers)
+SUDO_CMD=""
+if [ "$(id -u)" -ne 0 ]; then
+    SUDO_CMD="sudo"
+fi
+
+# Parse arguments
+TARGET=$1
+SKIP_DEPS=false
+
+if [ -z "$TARGET" ]; then
+    echo "Error: Missing target architecture parameter"
+    echo "Usage: $0 <target> [--skip-deps]"
+    echo "Example: $0 x86_64-unknown-linux-musl"
+    exit 1
+fi
+
+if [ "$2" == "--skip-deps" ]; then
+    SKIP_DEPS=true
+fi
+
+# System detection function
+detect_system() {
+    local system="unknown"
+
+    # Check /etc/os-release first
+    if [ -f /etc/os-release ]; then
+        # shellcheck source=/dev/null
+        source /etc/os-release
+        case "$ID" in
+            ubuntu|debian|linuxmint)
+                system="debian"
+                ;;
+            # Alibaba Cloud Linux 3 - use dedicated configuration
+            alinux)
+                if [ "${VERSION_ID}" = "3" ]; then
+                    system="alinux3"
+                else
+                    # Other versions fall back to generic rhel configuration
+                    system="rhel"
+                fi
+                ;;
+            # Amazon Linux - use dedicated configuration
+            amzn)
+                if [ "${VERSION_ID}" = "2" ]; then
+                    system="amazonlinux2"
+                elif [ "${VERSION_ID}" = "2023" ]; then
+                    system="amazonlinux2023"
+                else
+                    # Other versions fall back to generic rhel configuration
+                    system="rhel"
+                fi
+                ;;
+            # CentOS - use version-specific configuration
+            centos)
+                if [ "${VERSION_ID}" = "7" ]; then
+                    system="centos7"
+                else
+                    # Other versions fall back to generic rhel configuration
+                    system="rhel"
+                fi
+                ;;
+            # Other RHEL-based distributions use generic configuration
+            rhel|fedora|rocky|almalinux)
+                system="rhel"
+                ;;
+            arch|manjaro)
+                system="arch"
+                ;;
+            alpine)
+                system="alpine"
+                ;;
+            *)
+                # Check ID_LIKE
+                if [ -n "${ID_LIKE:-}" ]; then
+                    case "$ID_LIKE" in
+                        *rhel*|*fedora*|*centos*)
+                            system="rhel"
+                            ;;
+                        *debian*|*ubuntu*)
+                            system="debian"
+                            ;;
+                        *arch*)
+                            system="arch"
+                            ;;
+                    esac
+                fi
+                ;;
+        esac
+    # Fall back to detecting package manager
+    elif command -v apt-get &> /dev/null; then
+        system="debian"
+    elif command -v dnf &> /dev/null || command -v yum &> /dev/null; then
+        system="rhel"
+    elif command -v pacman &> /dev/null; then
+        system="arch"
+    elif command -v apk &> /dev/null; then
+        system="alpine"
+    fi
+
+    echo "$system"
+}
+
+# Dependency installation function
+install_dependencies() {
+    local system
+    system=$(detect_system)
+
+    if [ "$system" == "unknown" ]; then
+        echo "Error: Unable to detect operating system type"
+        echo "Please manually install dependencies or use --skip-deps parameter to skip dependency installation"
+        exit 1
+    fi
+
+    local config_file="${SCRIPT_DIR}/packages/${system}.conf"
+
+    if [ ! -f "$config_file" ]; then
+        echo "Error: Unsupported system '$system'"
+        echo "Configuration file not found: $config_file"
+        echo "Supported systems: debian, rhel, amazonlinux2, alinux3, centos7, arch, alpine"
+        echo "Hint: If you are using a RHEL-based distribution, the generic rhel configuration may be used"
+        exit 1
+    fi
+
+    echo "=========================================="
+    echo "Detected operating system: $system"
+    echo "Configuration file: $config_file"
+    echo "=========================================="
+
+    # Load configuration file
+    # shellcheck source=/dev/null
+    source "$config_file"
+
+    # Execute mirror setup commands (if defined)
+    if [ ${#MIRROR_SETUP_COMMANDS[@]} -gt 0 ]; then
+        echo "Configuring package mirrors..."
+        for cmd in "${MIRROR_SETUP_COMMANDS[@]}"; do
+            eval "$cmd"
+        done
+    fi
+
+    # Update package manager
+    echo "Updating package manager..."
+    eval "$PKG_UPDATE_CMD"
+
+    # Install packages
+    echo "Installing dependencies (${#PACKAGES[@]} packages)..."
+    eval "$PKG_INSTALL_CMD ${PACKAGES[*]}"
+
+    # Execute additional setup commands
+    if [ ${#EXTRA_SETUP_COMMANDS[@]} -gt 0 ]; then
+        echo "Executing system-specific configuration..."
+        for cmd in "${EXTRA_SETUP_COMMANDS[@]}"; do
+            eval "$cmd"
+        done
+    fi
+
+    echo "=========================================="
+    echo "Dependency installation completed"
+    echo "=========================================="
+}
+
+# Install dependencies
+if [ "$SKIP_DEPS" == false ]; then
+    install_dependencies
+else
+    echo "Skipping dependency installation (--skip-deps)"
+fi
+
+# Apply patches
+echo "=========================================="
+echo "Applying patches..."
+echo "=========================================="
+pushd builder
+# Only execute git commands in git repositories
+if [ -d .git ]; then
+    git reset --hard HEAD
+    git clean -fd
+fi
+for i in ../targets/"${TARGET}"/*; do
+    if [[ $i == *.patch ]]; then
+        echo "Applying patch: $i"
+        patch -Np1 -i "$i"
+    fi
+done
+popd
+
+# crosstool-ng
+echo "=========================================="
+echo "Building crosstool-ng..."
+echo "=========================================="
+${SUDO_CMD} mkdir -p /opt
+${SUDO_CMD} chmod 0777 /opt
+${SUDO_CMD} rm -rf /opt/ct-ng
+pushd builder
+./bootstrap
+./configure --prefix=/opt/ct-ng
+make -j"$(nproc)"
+${SUDO_CMD} make install
+popd
+echo "crosstool-ng installation completed: /opt/ct-ng"
+
+# Build
+echo "=========================================="
+echo "Building toolchain: ${TARGET}"
+echo "=========================================="
+rm -rf build
+mkdir -p build
+cp targets/"${TARGET}"/config build/.config
+pushd build
+/opt/ct-ng/bin/ct-ng olddefconfig
+
+# Reapply custom mirror configuration (olddefconfig resets some configurations)
+if grep -q "CT_MUSL_MIRRORS=" ../targets/"${TARGET}"/config; then
+    MUSL_MIRRORS=$(grep "CT_MUSL_MIRRORS=" ../targets/"${TARGET}"/config | head -1)
+    sed -i "s|^CT_MUSL_MIRRORS=.*|${MUSL_MIRRORS}|" .config
+    echo "Custom MUSL mirror configuration applied"
+fi
+
+/opt/ct-ng/bin/ct-ng build
+popd
+echo "Toolchain build completed"
+
+# Tarball
+echo "=========================================="
+echo "Packaging toolchain..."
+echo "=========================================="
+${SUDO_CMD} mv /opt/x-tools/"${TARGET}" .
+${SUDO_CMD} chown -R root:root "${TARGET}"
+${SUDO_CMD} tar -cJvf "${TARGET}.tar.xz" "${TARGET}"
+${SUDO_CMD} sha256sum "${TARGET}.tar.xz" | awk '{ print $1 }' > "${TARGET}.tar.xz.sha256"
+
+echo "=========================================="
+echo "Build completed!"
+echo "=========================================="
+echo "Output files:"
+echo "  - ${TARGET}.tar.xz"
+echo "  - ${TARGET}.tar.xz.sha256"
+echo ""
+echo "SHA256: $(cat "${TARGET}.tar.xz.sha256")"
+echo "=========================================="

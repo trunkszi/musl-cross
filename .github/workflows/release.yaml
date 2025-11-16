@@ -1,0 +1,281 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: 'Target architecture list (comma-separated)'
+        required: false
+        default: 'x86_64-unknown-linux-musl'
+        type: string
+      containers:
+        description: 'Container selection (comma-separated: amazonlinux2,alinux3,centos7,all)'
+        required: false
+        default: 'all'
+        type: string
+      create_release:
+        description: 'Create GitHub Release'
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: 'Release tag (required if create_release is true)'
+        required: false
+        default: ''
+        type: string
+  release:
+    types:
+      - published
+
+jobs:
+  # Prepare build matrix
+  prepare-matrix:
+    name: Prepare Build Matrix
+    runs-on: self-hosted
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up matrix
+        id: set-matrix
+        run: |
+          # Define all available container configurations
+          declare -A containers
+          containers[amazonlinux2]='{"image":"public.ecr.aws/amazonlinux/amazonlinux:2","label":"amazonlinux2"}'
+          containers[alinux3]='{"image":"alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest","label":"alinux3"}'
+          containers[centos7]='{"image":"centos:7.9.2009","label":"centos7"}'
+
+          # Parse target architectures
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            IFS=',' read -ra TARGETS <<< "${{ inputs.targets }}"
+            CONTAINER_INPUT="${{ inputs.containers }}"
+          else
+            TARGETS=("x86_64-unknown-linux-musl")
+            CONTAINER_INPUT="all"
+          fi
+
+          # Parse container selection
+          if [ "$CONTAINER_INPUT" = "all" ]; then
+            SELECTED_CONTAINERS=("amazonlinux2" "alinux3" "centos7")
+          else
+            IFS=',' read -ra SELECTED_CONTAINERS <<< "$CONTAINER_INPUT"
+          fi
+
+          # Build matrix
+          matrix_json='{"include":['
+          first=true
+          for target in "${TARGETS[@]}"; do
+            for container in "${SELECTED_CONTAINERS[@]}"; do
+              if [ "$first" = true ]; then
+                first=false
+              else
+                matrix_json+=','
+              fi
+              matrix_json+="{\"target\":\"$target\",\"container\":${containers[$container]}}"
+            done
+          done
+          matrix_json+=']}'
+
+          echo "matrix=$matrix_json" >> $GITHUB_OUTPUT
+          echo "Generated matrix:"
+          echo "$matrix_json" | jq .
+
+  build:
+    name: Build ${{ matrix.target }} on ${{ matrix.container.label }}
+    runs-on: self-hosted
+    needs: prepare-matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+    timeout-minutes: 120
+    env:
+      # Use different working directory for each matrix job to avoid conflicts
+      WORK_DIR: ${{ github.workspace }}-${{ matrix.container.label }}
+    steps:
+      - name: Manual checkout
+        run: |
+          echo "=== Manual checkout process ==="
+          echo "Workspace: $GITHUB_WORKSPACE"
+
+          # Clean problematic directories with sudo
+          sudo rm -rf "$GITHUB_WORKSPACE/builder/build" || true
+          sudo rm -rf "$GITHUB_WORKSPACE/builder/.build" || true
+          sudo rm -rf "$GITHUB_WORKSPACE/build" || true
+
+          # Check if .git directory exists
+          if [ -d "$GITHUB_WORKSPACE/.git" ]; then
+            echo "Git repository exists, updating..."
+            cd "$GITHUB_WORKSPACE"
+
+            # Fix ownership
+            sudo chown -R $(whoami):$(whoami) .git || true
+
+            # Configure git
+            git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+            # Fetch and reset
+            git fetch origin ${{ github.ref }}
+            git reset --hard FETCH_HEAD
+            git clean -ffdx -e builder/build -e builder/.build -e build
+
+            # Update submodules
+            git submodule update --init --recursive
+          else
+            echo "Git repository does not exist, cloning..."
+            sudo rm -rf "$GITHUB_WORKSPACE"
+            sudo mkdir -p "$GITHUB_WORKSPACE"
+            sudo chown -R $(whoami):$(whoami) "$GITHUB_WORKSPACE"
+
+            cd "$(dirname "$GITHUB_WORKSPACE")"
+            git clone --depth=1 --branch=${{ github.ref_name }} \
+              https://github.com/${{ github.repository }}.git \
+              "$(basename "$GITHUB_WORKSPACE")"
+
+            cd "$GITHUB_WORKSPACE"
+            git submodule update --init --recursive
+          fi
+
+          echo "=== Checkout completed ==="
+          ls -la "$GITHUB_WORKSPACE"
+
+      - name: Check disk space
+        run: |
+          echo "Disk space:"
+          df -h
+          echo ""
+          echo "Docker info:"
+          docker info | grep -E "Docker Root Dir|Storage Driver" || true
+
+      - name: Check Docker
+        run: |
+          # Check if Docker is running
+          docker info || echo "Docker may not be running, but will try to continue"
+          docker --version
+
+      - name: Build with Docker
+        run: |
+          chmod +x scripts/build-with-docker.sh
+          ./scripts/build-with-docker.sh \
+            "${{ matrix.target }}" \
+            "${{ matrix.container.image }}" \
+            "${{ matrix.container.label }}"
+
+      - name: Collect build artifacts
+        run: |
+          # Copy build artifacts from container
+          docker cp musl-cross-build-${{ matrix.container.label }}:/workspace/musl-cross/${{ matrix.target }}-${{ matrix.container.label }}.tar.xz .
+          docker cp musl-cross-build-${{ matrix.container.label }}:/workspace/musl-cross/${{ matrix.target }}-${{ matrix.container.label }}.tar.xz.sha256 .
+
+          echo "Build artifacts:"
+          ls -lh ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz*
+
+          echo "SHA256:"
+          cat ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz.sha256
+
+      - name: Clean up Docker resources
+        if: always()
+        run: |
+          # Stop and remove container
+          docker stop musl-cross-build-${{ matrix.container.label }} || true
+          docker rm musl-cross-build-${{ matrix.container.label }} || true
+
+          # Clean up Docker system (remove unused data)
+          docker system prune -f || true
+
+          echo "Disk space after cleanup:"
+          df -h
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz
+          path: ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz.sha256
+          path: ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Clean build directory using Docker (to handle permission issues)
+          docker exec musl-cross-build-${{ matrix.container.label }} \
+            bash -c 'cd /workspace/musl-cross && rm -rf builder/build builder/.build' || true
+
+          # Stop and remove container
+          docker stop musl-cross-build-${{ matrix.container.label }} || true
+          docker rm -f musl-cross-build-${{ matrix.container.label }} || true
+
+          # Clean build directory on host (if container cleanup failed)
+          sudo rm -rf builder/build builder/.build || true
+
+          # Clean up Docker system
+          docker system prune -f || true
+
+  release:
+    name: Release
+    runs-on: self-hosted
+    needs:
+      - build
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.create_release == true)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          pattern: "*.tar.*"
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          echo "| Filename | Sha256sum |" > RELEASE.md
+          echo "| -------- | --------- |" >> RELEASE.md
+          for i in release/*.sha256; do
+            echo "| $(basename $i .sha256) | $(cat $i) |" >> RELEASE.md
+          done
+
+          echo "Release content:"
+          cat RELEASE.md
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Determine release tag
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            TAG="${{ inputs.release_tag }}"
+          fi
+
+          echo "Release tag: $TAG"
+
+          # Check if release exists
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, uploading artifacts..."
+            for i in release/*.tar.xz; do
+              gh release upload "$TAG" "$i" "$i.sha256" --clobber
+            done
+            gh release edit "$TAG" -F RELEASE.md
+          else
+            echo "Creating new release $TAG..."
+            gh release create "$TAG" \
+              --title "Release $TAG" \
+              --notes-file RELEASE.md \
+              release/*.tar.xz release/*.sha256
+          fi
