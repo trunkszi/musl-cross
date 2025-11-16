@@ -48,6 +48,15 @@ docker run -d \
 if [[ "${CONTAINER_IMAGE}" == *"alinux3"* ]]; then
     echo "Configuring Alibaba Cloud Linux 3 mirror..."
     docker exec "${CONTAINER_NAME}" bash -c '
+        # Kill any existing dnf/yum processes to avoid lock issues
+        pkill -9 dnf || true
+        pkill -9 yum || true
+        pkill -9 packagekitd || true
+
+        # Remove lock files
+        rm -f /var/run/yum.pid /var/run/dnf.pid
+        rm -f /var/cache/dnf/*pid /var/cache/yum/*pid
+
         # Backup original configuration
         mkdir -p /etc/yum.repos.d/backup
         cp /etc/yum.repos.d/*.repo /etc/yum.repos.d/backup/ 2>/dev/null || true
