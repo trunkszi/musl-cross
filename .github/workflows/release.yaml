@@ -27,6 +27,10 @@ on:
     types:
       - published
 
+permissions:
+  contents: write
+  packages: write
+
 jobs:
   # Prepare build matrix
   prepare-matrix:
