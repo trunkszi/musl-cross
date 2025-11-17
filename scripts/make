@@ -47,7 +47,16 @@ detect_system() {
         # shellcheck source=/dev/null
         source /etc/os-release
         case "$ID" in
-            ubuntu|debian|linuxmint)
+            # Ubuntu - use version-specific configuration
+            ubuntu)
+                if [ "${VERSION_ID}" = "22.04" ]; then
+                    system="ubuntu22"
+                else
+                    # Other versions fall back to generic debian configuration
+                    system="debian"
+                fi
+                ;;
+            debian|linuxmint)
                 system="debian"
                 ;;
             # Alibaba Cloud Linux 3 - use dedicated configuration
@@ -136,7 +145,7 @@ install_dependencies() {
     if [ ! -f "$config_file" ]; then
         echo "Error: Unsupported system '$system'"
         echo "Configuration file not found: $config_file"
-        echo "Supported systems: debian, rhel, amazonlinux2, alinux3, centos7, arch, alpine"
+        echo "Supported systems: debian, ubuntu22, rhel, amazonlinux2, alinux3, centos7, arch, alpine"
         echo "Hint: If you are using a RHEL-based distribution, the generic rhel configuration may be used"
         exit 1
     fi
