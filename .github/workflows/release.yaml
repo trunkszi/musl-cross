@@ -35,7 +35,7 @@ jobs:
   # Prepare build matrix
   prepare-matrix:
     name: Prepare Build Matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
@@ -91,7 +91,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.target }} on ${{ matrix.container.label }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: prepare-matrix
     strategy:
       fail-fast: false
@@ -198,7 +198,7 @@ jobs:
 
   release:
     name: Release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs:
       - build
     if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.create_release == true)
