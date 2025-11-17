@@ -112,6 +112,24 @@ elif [[ "${CONTAINER_IMAGE}" == *"centos"* ]] || [[ "${OS_LABEL}" == "centos7" ]
         yum makecache
         echo "Mirror configuration completed"
     '
+elif [[ "${CONTAINER_IMAGE}" == *"ubuntu"* ]] || [[ "${OS_LABEL}" == "ubuntu22" ]]; then
+    echo "Configuring Ubuntu mirror..."
+    docker exec "${CONTAINER_NAME}" bash -c '
+        # Backup original sources.list
+        cp /etc/apt/sources.list /etc/apt/sources.list.backup 2>/dev/null || true
+
+        # Replace with Aliyun mirror (faster in China)
+        cat > /etc/apt/sources.list <<EOF
+deb https://mirrors.aliyun.com/ubuntu/ jammy main restricted universe multiverse
+deb https://mirrors.aliyun.com/ubuntu/ jammy-updates main restricted universe multiverse
+deb https://mirrors.aliyun.com/ubuntu/ jammy-backports main restricted universe multiverse
+deb https://mirrors.aliyun.com/ubuntu/ jammy-security main restricted universe multiverse
+EOF
+
+        # Update package lists
+        apt-get update
+        echo "Mirror configuration completed"
+    '
 fi
 
 # Execute build

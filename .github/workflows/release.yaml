@@ -9,7 +9,7 @@ on:
         default: 'x86_64-unknown-linux-musl'
         type: string
       containers:
-        description: 'Container selection (comma-separated: amazonlinux2,alinux3,centos7,all)'
+        description: 'Container selection (comma-separated: amazonlinux2,alinux3,centos7,ubuntu22,all)'
         required: false
         default: 'all'
         type: string
@@ -48,6 +48,7 @@ jobs:
           containers[amazonlinux2]='{"image":"public.ecr.aws/amazonlinux/amazonlinux:2","label":"amazonlinux2"}'
           containers[alinux3]='{"image":"alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest","label":"alinux3"}'
           containers[centos7]='{"image":"centos:7.9.2009","label":"centos7"}'
+          containers[ubuntu22]='{"image":"ubuntu:22.04","label":"ubuntu22"}'
 
           # Parse target architectures
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -60,7 +61,7 @@ jobs:
 
           # Parse container selection
           if [ "$CONTAINER_INPUT" = "all" ]; then
-            SELECTED_CONTAINERS=("amazonlinux2" "alinux3" "centos7")
+            SELECTED_CONTAINERS=("amazonlinux2" "alinux3" "centos7" "ubuntu22")
           else
             IFS=',' read -ra SELECTED_CONTAINERS <<< "$CONTAINER_INPUT"
           fi
