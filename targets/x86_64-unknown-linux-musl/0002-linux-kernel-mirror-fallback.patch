@@ -1,0 +1,22 @@
+Add a kernel.org Edge mirror as a fallback for linux tarball downloads.
+
+The default CT_Mirrors function returns only cdn.kernel.org for
+kernel.org/linux. When that single CDN endpoint hiccups (observed as a
+transient "linux: download failed" while pulling linux-5.4.296 from a
+US Azure runner), CT_GetFile has nothing else to try and the whole
+build aborts. Adding the kernel.org Edge mirror as a second URL lets
+CT_GetFile fall back to a distinct infrastructure path (kernel.org's
+official Edge mirror network, separate from the Fastly-fronted cdn
+endpoint) before failing.
+
+diff --git a/scripts/functions b/scripts/functions
+--- a/scripts/functions
++++ b/scripts/functions
+@@ -1855,6 +1855,7 @@
+                 ;;
+             [34567].*)
+                 echo "https://cdn.kernel.org/pub/linux/kernel/v${version%%.*}.x"
++                echo "https://mirrors.edge.kernel.org/pub/linux/kernel/v${version%%.*}.x"
+                 ;;
+             2.6.*)
+                 echo "https://cdn.kernel.org/pub/linux/kernel/v2.6"

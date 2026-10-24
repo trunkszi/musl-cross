@@ -1,0 +1,18 @@
+Enable GCC libsanitizer for the supported x86_64 musl target.
+
+GCC 16.2 already includes linux/filter.h and defines struct_sock_fprog_sz
+for SANITIZER_LINUX, so no GCC source patch is required. Remove only
+crosstool-NG's conservative musl gate. uClibc-ng remains disabled.
+
+diff --git a/config/cc/gcc.in b/config/cc/gcc.in
+--- a/config/cc/gcc.in
++++ b/config/cc/gcc.in
+@@ -328,7 +328,7 @@ config CC_GCC_LIBSANITIZER
+     tristate
+     prompt "Compile libsanitizer"
+     depends on THREADS_NATIVE
+-    depends on !LIBC_UCLIBC_NG && !LIBC_MUSL # Currently lacks required headers (like netrom.h)
++    depends on !LIBC_UCLIBC_NG # GCC 16.2 supports libsanitizer with musl on x86_64
+     depends on ARCH_SUPPORTS_LIBSANITIZER
+     help
+       libsanitizer is a library which provides run-time sanitising of either

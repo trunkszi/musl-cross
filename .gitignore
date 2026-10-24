@@ -1,0 +1,7 @@
+
+.claude/
+__pycache__/
+/*.tar.xz
+/*.tar.xz.sha256
+/*.tar.xz.json
+/RELEASE.md

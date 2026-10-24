@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
+usage() { echo "Usage: $0 <target> [--skip-deps]" >&2; exit 64; }
+[[ $# -ge 1 && $# -le 2 ]] || usage
+TARGET=$1
+[[ $TARGET =~ ^[a-z0-9_]+(-[a-z0-9_]+)+$ && -f ${PROJECT_ROOT}/targets/${TARGET}/config ]] || {
+    echo "Unsupported target: ${TARGET}" >&2; exit 64;
+}
+[[ $# == 1 || $2 == --skip-deps ]] || usage
+metadata="${PROJECT_ROOT}/targets/${TARGET}/versions"
+[[ -f $metadata ]] || { echo "Missing target version metadata" >&2; exit 1; }
+# Read a deliberately restricted data format; never execute version metadata.
+unset CTNG_RELEASE_TAG CTNG_COMMIT EXPECTED_GCC_VERSION EXPECTED_MUSL_VERSION EXPECTED_MOLD_VERSION
+unset EXPECTED_BINUTILS_VERSION EXPECTED_LINUX_VERSION EXPECTED_MUSL_LOADER EXPECTED_RELEASE_TAG
+declare -A metadata_seen=()
+while IFS= read -r line || [[ -n $line ]]; do
+    [[ -n $line && $line != \#* ]] || continue
+    if [[ ! $line =~ ^([A-Z_][A-Z0-9_]*)=([A-Za-z0-9_.-]+)$ ]]; then
+        echo "Invalid version metadata: expected a literal KEY=VALUE" >&2; exit 1
+    fi
+    key=${BASH_REMATCH[1]}
+    value=${BASH_REMATCH[2]}
+    case "$key" in
+        CTNG_RELEASE_TAG|CTNG_COMMIT|EXPECTED_GCC_VERSION|EXPECTED_MUSL_VERSION|EXPECTED_MOLD_VERSION|EXPECTED_BINUTILS_VERSION|EXPECTED_LINUX_VERSION|EXPECTED_MUSL_LOADER|EXPECTED_RELEASE_TAG) ;;
+        *) echo "Unsupported version metadata key: ${key}" >&2; exit 1 ;;
+    esac
+    [[ ! ${metadata_seen[$key]+present} ]] || { echo "Duplicate version metadata key" >&2; exit 1; }
+    metadata_seen[$key]=true
+    printf -v "$key" '%s' "$value"
+done < "$metadata"
+: "${CTNG_COMMIT:?}" "${EXPECTED_GCC_VERSION:?}" "${EXPECTED_MUSL_VERSION:?}" "${EXPECTED_MUSL_LOADER:?}"
+SUDO=()
+[[ $EUID == 0 ]] || SUDO=(sudo)
+BUILD_WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/musl-cross-build.XXXXXX")
+prefix="/opt/x-tools/${TARGET}"
+archive="${PROJECT_ROOT}/${TARGET}.tar.xz"
+archive_tmp="${archive}.tmp"
+lock_file="${TMPDIR:-/tmp}/musl-cross-${TARGET}-${UID}.lock"
+prefix_created=false
+archive_tmp_owned=false
+lock_owned=false
+cleanup() {
+    local status=$?
+    trap - EXIT
+    set +e
+    if [[ $status != 0 && $prefix_created == true ]]; then
+        ${SUDO[@]+"${SUDO[@]}"} rm -rf -- "$prefix" || echo "Failed to clean owned install prefix" >&2
+    fi
+    if [[ $archive_tmp_owned == true ]]; then
+        ${SUDO[@]+"${SUDO[@]}"} rm -f -- "$archive_tmp" || echo "Failed to clean owned archive staging file" >&2
+    fi
+    rm -rf -- "$BUILD_WORK_DIR" || true
+    if [[ $lock_owned == true ]]; then
+        rm -f -- "$lock_file" || true
+        flock -u 9 || true
+        exec 9>&-
+    fi
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'echo "BUILD_FAILED: line ${LINENO}; Published v0.0.1 Release: UNTOUCHED" >&2' ERR
+# shellcheck source=scripts/host-dependencies.sh
+source "${SCRIPT_DIR}/host-dependencies.sh"
+if [[ ${2:-} != --skip-deps ]]; then
+    echo "INSTALL_DEPENDENCIES: START"
+    install_dependencies
+    echo "::notice title=Toolchain dependencies::INSTALL_DEPENDENCIES: PASS"
+fi
+# CentOS 7 ships Git 1.8 without -C; mounted CI checkouts have a different owner.
+builder_head=$(cd -- "${PROJECT_ROOT}/builder"; git -c "safe.directory=*" rev-parse HEAD)
+[[ $builder_head == "$CTNG_COMMIT" ]] || {
+    echo "builder HEAD does not match CTNG_COMMIT" >&2; exit 1;
+}
+builder_status=$(cd -- "${PROJECT_ROOT}/builder"; git -c "safe.directory=*" status --porcelain)
+[[ -z $builder_status ]] || {
+    echo "builder is dirty; refusing to build unrecorded source" >&2; exit 1;
+}
+BUILD_JOBS=${BUILD_JOBS:-2}
+[[ $BUILD_JOBS =~ ^[1-9][0-9]*$ ]] || { echo "Invalid BUILD_JOBS" >&2; exit 64; }
+${SUDO[@]+"${SUDO[@]}"} mkdir -p /opt/x-tools
+# A fixed CTNG target prefix is shared: hold its lock until packaging is complete.
+exec 9>"$lock_file"
+flock -n 9 || { echo "Another build owns ${TARGET}" >&2; exit 1; }
+lock_owned=true
+[[ ! -e /opt/x-tools/${TARGET} ]] || {
+    echo "Install prefix already exists: /opt/x-tools/${TARGET}; use a fresh build container" >&2; exit 1;
+}
+${SUDO[@]+"${SUDO[@]}"} mkdir -- "$prefix"
+prefix_created=true
+${SUDO[@]+"${SUDO[@]}"} chown "${UID}:$(id -g)" "/opt/x-tools/${TARGET}"
+mkdir -p "${BUILD_WORK_DIR}/source" "${BUILD_WORK_DIR}/build"
+(cd -- "${PROJECT_ROOT}/builder"; git -c "safe.directory=*" archive "$CTNG_COMMIT") | tar -xf - -C "${BUILD_WORK_DIR}/source"
+for i in "${PROJECT_ROOT}/targets/${TARGET}/"*.patch; do
+    [[ -f $i ]] || continue
+    patch --fuzz=0 --batch -Np1 --dry-run -d "${BUILD_WORK_DIR}/source" -i "$i"
+    patch --fuzz=0 --batch -Np1 -d "${BUILD_WORK_DIR}/source" -i "$i"
+done
+cd -- "${BUILD_WORK_DIR}/source"
+./bootstrap
+echo "::notice title=Toolchain bootstrap::CTNG_BOOTSTRAP: PASS"
+./configure --prefix="${BUILD_WORK_DIR}/ct-ng"
+make -j"${BUILD_JOBS}"
+make install
+cp -- "${PROJECT_ROOT}/targets/${TARGET}/config" "${BUILD_WORK_DIR}/build/.config"
+cd -- "${BUILD_WORK_DIR}/build"
+"${BUILD_WORK_DIR}/ct-ng/bin/ct-ng" olddefconfig
+for component in GCC MUSL MOLD BINUTILS LINUX; do
+    variable="EXPECTED_${component}_VERSION"
+    expected=${!variable:-}
+    if [[ -n $expected ]] && ! grep -Fxq "CT_${component}_VERSION=\"${expected}\"" .config; then
+        echo "Resolved ${component} version does not match ${expected}" >&2
+        exit 1
+    fi
+done
+# CTNG normalizes mirrors; restore only the explicitly configured target mirror.
+mirror=$(sed -n '/^CT_MUSL_MIRRORS=/p' "${PROJECT_ROOT}/targets/${TARGET}/config")
+if [[ -n $mirror ]]; then
+    grep -q '^CT_MUSL_MIRRORS=' .config
+    [[ $mirror != *$'\n'* ]] || { echo "Duplicate mirror settings" >&2; exit 1; }
+    escaped=${mirror//\\/\\\\}
+    escaped=${escaped//&/\\&}
+    escaped=${escaped//|/\\|}
+    sed -i "s|^CT_MUSL_MIRRORS=.*|${escaped}|" .config
+fi
+echo "::notice title=Toolchain build::CTNG_BUILD: START"
+"${BUILD_WORK_DIR}/ct-ng/bin/ct-ng" build."${BUILD_JOBS}"
+"${SCRIPT_DIR}/verify-toolchain.sh" "$TARGET" "/opt/x-tools/${TARGET}" \
+    "$EXPECTED_GCC_VERSION" "$EXPECTED_MUSL_VERSION" "$EXPECTED_MUSL_LOADER" "${EXPECTED_MOLD_VERSION:-}"
+[[ ! -e $archive_tmp && ! -L $archive_tmp ]] || { echo "Archive staging path already exists" >&2; exit 1; }
+archive_tmp_owned=true
+${SUDO[@]+"${SUDO[@]}"} tar -C /opt/x-tools --owner=0 --group=0 -cJvf "$archive_tmp" "$TARGET"
+mv -- "$archive_tmp" "$archive"
+archive_tmp_owned=false
+digest=$(sha256sum "$archive")
+digest=${digest%% *}
+[[ $digest =~ ^[0-9a-f]{64}$ ]] || { echo "Invalid SHA-256 output" >&2; exit 1; }
+printf '%s\n' "$digest" > "${archive}.sha256"
+printf '%s  %s\n' "$digest" "$archive" | sha256sum --check -
+echo "Toolchain build and packaging: PASS"

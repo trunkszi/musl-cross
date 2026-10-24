@@ -1,0 +1,203 @@
+name: Release
+
+on:
+  schedule:
+    - cron: '10 2 * * *'
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: Target triple
+        type: string
+        default: x86_64-unknown-linux-musl
+      containers:
+        description: 'Host labels, comma-separated, or all'
+        type: string
+        default: all
+      create_release:
+        description: Publish the complete verified matrix
+        type: boolean
+        default: false
+      release_tag:
+        description: Mutable release tag
+        type: string
+        default: v0.0.1
+      source_run_id:
+        description: Reuse a successful canonical run's candidate and artifacts
+        type: string
+        default: ''
+      check_upstream:
+        description: Discover and preflight the latest stable CTNG release
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: musl-cross-release
+  cancel-in-progress: false
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.prepare.outputs.matrix }}
+      should_build: ${{ steps.prepare.outputs.should_build }}
+      upstream_updated: ${{ steps.prepare.outputs.upstream_updated }}
+      should_release: ${{ steps.prepare.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          submodules: true
+      - name: Validate local contracts
+        run: bash tests/run.sh
+      - name: Resolve upstream and prepare immutable candidate
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_EVENT: ${{ github.event_name }}
+          INPUT_TARGETS: ${{ inputs.targets }}
+          INPUT_CONTAINERS: ${{ inputs.containers }}
+          CHECK_UPSTREAM: ${{ inputs.check_upstream }}
+          CREATE_RELEASE: ${{ inputs.create_release }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: python3 scripts/ci.py prepare "$RUNNER_TEMP/candidate-source"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: steps.prepare.outputs.should_build == 'true'
+        with:
+          name: candidate-source
+          path: ${{ runner.temp }}/candidate-source/
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: failure()
+        with:
+          name: prepare-diagnostics
+          path: ${{ runner.temp }}/candidate-source/
+          if-no-files-found: warn
+
+  build:
+    needs: prepare-matrix
+    if: needs.prepare-matrix.outputs.should_build == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: candidate-source
+          path: ${{ runner.temp }}/candidate-source
+      - name: Restore exact candidate
+        run: python3 scripts/ci.py restore "$RUNNER_TEMP/candidate-source"
+      - name: Validate candidate contracts
+        run: bash tests/run.sh
+      - name: Build and verify native toolchain
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+          BUILD_IMAGE: ${{ matrix.container.image }}
+          BUILD_OS_LABEL: ${{ matrix.container.label }}
+          BUILD_JOBS: '2'
+        run: |
+          set -euo pipefail
+          ./scripts/build-with-docker.sh "$BUILD_TARGET" "$BUILD_IMAGE" "$BUILD_OS_LABEL"
+          python3 scripts/ci.py receipt "$RUNNER_TEMP/candidate-source/source.json" \
+            "${BUILD_TARGET}-${BUILD_OS_LABEL}.tar.xz" "$BUILD_OS_LABEL"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: toolchain-${{ matrix.container.label }}
+          path: |
+            *.tar.xz
+            *.tar.xz.sha256
+            *.tar.xz.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: failure()
+        with:
+          name: build-${{ matrix.container.label }}-diagnostics
+          path: ${{ runner.temp }}/candidate-source/
+          if-no-files-found: warn
+
+  release:
+    needs: [prepare-matrix, build]
+    if: >-
+      always() && needs.prepare-matrix.result == 'success' &&
+      needs.prepare-matrix.outputs.should_release == 'true' &&
+      (needs.build.result == 'success' ||
+       (github.event_name == 'workflow_dispatch' && inputs.source_run_id != '' && needs.build.result == 'skipped'))
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: candidate-source
+          path: ${{ runner.temp }}/candidate-source
+          run-id: ${{ inputs.source_run_id || github.run_id }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: toolchain-*
+          path: ${{ runner.temp }}/release
+          merge-multiple: true
+          run-id: ${{ inputs.source_run_id || github.run_id }}
+          github-token: ${{ github.token }}
+      - name: Validate artifact run before executing its source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: python3 scripts/ci.py validate-run "$RUNNER_TEMP/candidate-source/source.json" --source-run-id "$SOURCE_RUN_ID"
+      - name: Restore built source
+        run: python3 scripts/ci.py restore "$RUNNER_TEMP/candidate-source"
+      - name: Verify all assets, upload, then update source and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag || 'v0.0.1' }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release.py publish "$RUNNER_TEMP/release" \
+            "$RUNNER_TEMP/candidate-source/source.json" \
+            --notes "$RUNNER_TEMP/candidate-source/RELEASE.md" --source-run-id "$SOURCE_RUN_ID"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: publication-diagnostics
+          path: ${{ runner.temp }}/candidate-source/
+          if-no-files-found: warn
+
+  notify-failure:
+    needs: [prepare-matrix, build, release]
+    if: >-
+      always() && (needs.prepare-matrix.result == 'failure' ||
+      needs.build.result == 'failure' || needs.release.result == 'failure')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        continue-on-error: true
+        with:
+          pattern: '*diagnostics'
+          path: ${{ runner.temp }}/diagnostics
+      - name: Write failure summary and notify configured mailbox
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DIAGNOSTIC_DIR: ${{ runner.temp }}/diagnostics
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          SMTP_PORT: ${{ vars.SMTP_PORT }}
+          NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
+        run: python3 scripts/notify-failure.py
